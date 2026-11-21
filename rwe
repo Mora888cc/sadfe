@@ -1,0 +1,2208 @@
+-- penablox_movement_gui.lua
+-- Penablox movement controller. Executor-hosted Luau (Real Executor / Byfron client).
+-- Sections: 1 constants | 2 capability probe | 3 utilities | 4 state |
+--           5 movement engine | 6 character lifecycle | 7 GUI | 8 persistence | 9 bootstrap
+-- No require(), no external assets, no load-time network fetch.
+
+--=============================================================================
+-- SECTION 1 — CONSTANTS AND PRESETS
+--=============================================================================
+
+local CONFIG_VERSION = 1
+local CONFIG_FOLDER  = "PenabloxMovement"
+local CONFIG_FILE    = "config.json"
+local CONFIG_PATH    = CONFIG_FOLDER .. "/" .. CONFIG_FILE
+
+local REASSERT_EPSILON   = 0.05   -- studs/s drift that counts as a clamp
+local REASSERT_BUDGET    = 90     -- writes per window before backing off
+local REASSERT_WINDOW    = 1.0    -- seconds
+local RB_MIN_JUMP        = 14     -- studs of unexplained displacement per frame
+local RB_WINDOW          = 2.0    -- seconds the rubber-band counter lives for
+local LOG_RATE           = 1.0    -- seconds between repeats of the same log key
+local DIAG_INTERVAL      = 0.2    -- diagnostic readout refresh
+local MICROSTEP_BURST    = 3      -- max micro-steps before a forced pause
+local DEFAULT_WALKSPEED  = 16     -- Roblox default, used only if capture fails
+local VANILLA_GRAVITY    = 196.2  -- workspace.Gravity default on a live server
+
+-- Speed bands. Multiplier -> semantic label shown next to the slider.
+local BANDS = {
+    { limit = 2.5,  name = "Stealth",    color = Color3.fromRGB(90, 200, 140) },
+    { limit = 5.0,  name = "Balanced",   color = Color3.fromRGB(230, 190, 90) },
+    { limit = 99.0, name = "Aggressive", color = Color3.fromRGB(235, 96, 96) },
+}
+
+local PRESETS = {
+    Default = {
+        multiplier = 1.0, rampTime = 0.35, jitter = 0.02,
+        layer2 = true, layer3 = false, layer4 = false, jumpPower = 50,
+    },
+    Balanced = {
+        multiplier = 3.0, rampTime = 0.20, jitter = 0.03,
+        layer2 = true, layer3 = true, layer4 = false, jumpPower = 60,
+    },
+    Aggressive = {
+        multiplier = 7.5, rampTime = 0.08, jitter = 0.06,
+        layer2 = true, layer3 = true, layer4 = false, jumpPower = 80,
+    },
+}
+
+local DEFAULTS = {
+    enabled        = true,
+    multiplier     = 3.0,
+    rampTime       = 0.20,
+    jitter         = 0.03,
+    jumpPower      = 60,
+    jumpEnabled    = false,
+    gravityScale   = 1.0,
+    gravityEnabled = false,
+    layer1         = true,
+    layer2         = true,
+    layer3         = true,
+    layer4         = false,
+    airControl     = false,
+    microStepDist  = 4.0,
+    microStepCool  = 1.5,
+    rbSensitivity  = 3,
+    maxForce       = 90000,
+    toggleKey      = "RightShift",
+    panicKey       = "RightControl",
+    uiScale        = 1.0,
+    minimized      = false,
+}
+
+--=============================================================================
+-- SECTION 2 — CAPABILITY PROBE
+--=============================================================================
+
+local function probe(fn)
+    local ok, value = pcall(fn)
+    if ok then return value end
+    return nil
+end
+
+local function buildEnv()
+    local env = {}
+    env.getgenv        = probe(function() return getgenv() end)
+    env.getrenv        = probe(function() return getrenv() end)
+    env.gethui         = probe(function() return gethui() end)
+    env.getreg         = probe(function() return getreg() end)
+    env.identify       = probe(function() return identifyexecutor() end)
+    env.loadstring     = probe(function() return loadstring end)
+    env.request        = probe(function() return request end)
+        or probe(function() return http_request end)
+        or probe(function() return syn.request end)
+        or probe(function() return fluxus.request end)
+    env.writefile      = probe(function() return writefile end)
+    env.readfile       = probe(function() return readfile end)
+    env.appendfile     = probe(function() return appendfile end)
+    env.isfile         = probe(function() return isfile end)
+    env.isfolder       = probe(function() return isfolder end)
+    env.makefolder     = probe(function() return makefolder end)
+    env.listfiles      = probe(function() return listfiles end)
+    env.delfile        = probe(function() return delfile end)
+    env.hookfunction   = probe(function() return hookfunction end)
+    env.hookmetamethod = probe(function() return hookmetamethod end)
+    env.getrawmeta     = probe(function() return getrawmetatable end)
+    env.setreadonly    = probe(function() return setreadonly end)
+    env.getnamecall    = probe(function() return getnamecallmethod end)
+    env.getconnections = probe(function() return getconnections end)
+    env.firesignal     = probe(function() return firesignal end)
+    env.cloneref       = probe(function() return cloneref end)
+    env.setclipboard   = probe(function() return setclipboard end)
+    env.getcustomasset = probe(function() return getcustomasset end)
+
+    env.hasFilesystem = env.writefile ~= nil and env.readfile ~= nil
+    env.canPersist    = env.hasFilesystem and env.makefolder ~= nil
+
+    return env
+end
+
+--=============================================================================
+-- SECTION 3 — UTILITIES
+--=============================================================================
+
+local function clamp(value, lo, hi)
+    if value < lo then return lo end
+    if value > hi then return hi end
+    return value
+end
+
+local function lerp(a, b, t)
+    return a + (b - a) * t
+end
+
+local function round(value, places)
+    local mult = 10 ^ (places or 0)
+    return math.floor(value * mult + 0.5) / mult
+end
+
+-- Bounded WaitForChild. Returns nil instead of yielding forever.
+local function waitFor(parent, name, timeout)
+    if not parent then return nil end
+    local existing = parent:FindFirstChild(name)
+    if existing then return existing end
+    local ok, child = pcall(function()
+        return parent:WaitForChild(name, timeout or 10)
+    end)
+    if ok then return child end
+    return nil
+end
+
+local function bandFor(multiplier)
+    for _, band in BANDS do
+        if multiplier <= band.limit then return band end
+    end
+    return BANDS[#BANDS]
+end
+
+-- Throttled logger: one line per key per LOG_RATE seconds.
+local logTimes = {}
+local function log(level, key, message)
+    local now = os.clock()
+    local last = logTimes[key]
+    if last and now - last < LOG_RATE then return end
+    logTimes[key] = now
+    print(string.format("[Penablox][%s] %s", level, message))
+end
+
+-- Forward declarations. These tables are populated in later sections but are
+-- captured by closures defined earlier in the file, so they must be in scope
+-- from here down.
+local ENV = nil
+local GUI = nil
+local Persistence = nil
+
+--=============================================================================
+-- SECTION 4 — STATE
+--=============================================================================
+
+local State = {}
+for key, value in pairs(DEFAULTS) do
+    State[key] = value
+end
+State.rbLocked = false          -- set by the rubber-band detector, needs user action
+State.loadedFromDisk = false
+State.savedAt = 0
+
+local function copyInto(target, source, whitelist)
+    for key, value in pairs(source) do
+        if whitelist == nil or whitelist[key] ~= nil then
+            if type(value) == type(target[key]) or target[key] == nil then
+                target[key] = value
+            end
+        end
+    end
+end
+
+--=============================================================================
+-- SECTION 5 — MOVEMENT ENGINE
+--=============================================================================
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local Workspace         = game:GetService("Workspace")
+local LocalPlayer       = Players.LocalPlayer
+
+local Engine = {}
+
+Engine.humanoid   = nil
+Engine.root       = nil
+Engine.character  = nil
+Engine.vanilla    = nil
+Engine.connection = nil
+Engine.constraint = nil
+Engine.attachment = nil
+Engine.dir        = nil
+Engine.speed      = 0
+Engine.target     = 0
+Engine.rampActive = false
+Engine.rampStart  = 0
+Engine.microLast  = 0
+Engine.microBurst = 0
+Engine.lastPos    = nil
+Engine.rbHits     = 0
+Engine.rbWindow   = 0
+Engine.reasserts  = 0
+Engine.reassertWindow = 0
+Engine.reassertBackoff = false
+Engine.framesSinceReassert = 0
+Engine.drift      = 0
+Engine.status     = { layer1 = false, layer2 = false, layer3 = false, layer4 = false }
+Engine.onNotice   = nil
+
+-- Records the pre-modification values. Every revert path reads this, never a
+-- magic number.
+function Engine.captureVanilla()
+    local hum = Engine.humanoid
+    if not hum then return end
+    Engine.vanilla = {
+        walkSpeed    = hum.WalkSpeed,
+        jumpPower    = hum.JumpPower,
+        jumpHeight   = hum.JumpHeight,
+        useJumpPower = hum.UseJumpPower,
+        hipHeight    = hum.HipHeight,
+        gravity      = Workspace.Gravity,
+    }
+end
+
+function Engine.destroyConstraint()
+    if Engine.constraint then
+        pcall(function() Engine.constraint.Enabled = false end)
+        pcall(function() Engine.constraint:Destroy() end)
+        Engine.constraint = nil
+    end
+    if Engine.attachment then
+        pcall(function() Engine.attachment:Destroy() end)
+        Engine.attachment = nil
+    end
+    Engine.status.layer3 = false
+end
+
+-- Restores every property from the snapshot. Safe to call twice.
+function Engine.restoreVanilla()
+    local snapshot = Engine.vanilla
+    local hum = Engine.humanoid
+    if not snapshot then return end
+    if hum and hum.Parent then
+        pcall(function()
+            hum.WalkSpeed    = snapshot.walkSpeed
+            hum.JumpPower    = snapshot.jumpPower
+            hum.JumpHeight   = snapshot.jumpHeight
+            hum.UseJumpPower = snapshot.useJumpPower
+            hum.HipHeight    = snapshot.hipHeight
+        end)
+    end
+    pcall(function() Workspace.Gravity = snapshot.gravity end)
+    Engine.status.layer1 = false
+    Engine.status.layer2 = false
+    Engine.status.layer4 = false
+end
+
+function Engine.stopConnection()
+    if Engine.connection then
+        pcall(function() Engine.connection:Disconnect() end)
+        Engine.connection = nil
+    end
+end
+
+-- Full teardown. Order: producers, connections, constraints, properties, refs.
+function Engine.detach()
+    Engine.stopConnection()
+    Engine.destroyConstraint()
+    Engine.restoreVanilla()
+    Engine.humanoid  = nil
+    Engine.root      = nil
+    Engine.character = nil
+    Engine.dir       = nil
+    Engine.speed     = 0
+    Engine.target    = 0
+    Engine.rampActive = false
+    Engine.lastPos   = nil
+    Engine.rbHits    = 0
+    Engine.rbWindow  = 0
+    Engine.reasserts = 0
+    Engine.reassertBackoff = false
+end
+
+-- Panic path. One frame: disconnect, destroy constraint, restore vanilla.
+function Engine.panic()
+    State.enabled = false
+    Engine.detach()
+    if Engine.onNotice then Engine.onNotice("Panic revert applied", "bad") end
+    log("warn", "panic", "panic key — all layers detached, vanilla restored")
+end
+
+-- Ensures exactly one constraint + attachment exist for the current root.
+local function ensureConstraint()
+    local root = Engine.root
+    if not root or not root.Parent then
+        Engine.destroyConstraint()
+        return false
+    end
+    if Engine.constraint and Engine.constraint.Parent == root and Engine.attachment and Engine.attachment.Parent == root then
+        return true
+    end
+    Engine.destroyConstraint()
+    local ok = pcall(function()
+        local attachment = Instance.new("Attachment")
+        attachment.Name = "PBX_VelocityAttachment"
+        attachment.Parent = root
+
+        local velocity = Instance.new("LinearVelocity")
+        velocity.Name = "PBX_VelocityConstraint"
+        velocity.Attachment0 = attachment
+        velocity.RelativeTo = Enum.ActuatorRelativeTo.World
+        velocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+        velocity.VectorVelocity = Vector3.zero
+        velocity.MaxForce = State.maxForce
+        velocity.Parent = root
+
+        Engine.attachment = attachment
+        Engine.constraint = velocity
+    end)
+    if not ok then
+        Engine.destroyConstraint()
+        log("error", "constraint", "LinearVelocity attach failed — Layer 3 unavailable")
+        return false
+    end
+    return true
+end
+
+-- Desired horizontal direction. Humanoid.MoveDirection first (it already
+-- accounts for seats and ladders); raw WASD projected on the camera basis as
+-- the fallback, world axes when the camera is near-vertical (top-down).
+local function readDirection()
+    local hum = Engine.humanoid
+    if not hum then return nil end
+
+    local moveDirection = hum.MoveDirection
+    if moveDirection.Magnitude > 0.05 then
+        local flat = Vector3.new(moveDirection.X, 0, moveDirection.Z)
+        if flat.Magnitude > 0.001 then return flat.Unit end
+    end
+
+    if not UserInputService.KeyboardEnabled then return nil end
+    local x, z = 0, 0
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) then z -= 1 end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) then z += 1 end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) then x -= 1 end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) then x += 1 end
+    if x == 0 and z == 0 then return nil end
+
+    local camera = Workspace.CurrentCamera
+    if camera then
+        local look = camera.CFrame.LookVector
+        local right = camera.CFrame.RightVector
+        local flatLook = Vector3.new(look.X, 0, look.Z)
+        local flatRight = Vector3.new(right.X, 0, right.Z)
+        if flatLook.Magnitude > 0.2 and flatRight.Magnitude > 0.2 then
+            local dir = flatLook.Unit * (-z) + flatRight.Unit * x
+            if dir.Magnitude > 0.01 then return dir.Unit end
+        end
+    end
+    return Vector3.new(x, 0, z).Unit
+end
+
+-- Shaped acceleration curve. Recomputed on input onset only; the ramp restarts
+-- on every fresh press so stop/start is not a plateau.
+local function computeSpeed()
+    local base = (Engine.vanilla and Engine.vanilla.walkSpeed) or DEFAULT_WALKSPEED
+    local target = base * State.multiplier
+    local rampTime = State.rampTime
+
+    if rampTime > 0 and Engine.rampActive then
+        local progress = (os.clock() - Engine.rampStart) / rampTime
+        if progress < 1 then
+            local eased = 1 - (1 - progress) * (1 - progress)
+            target = target * eased
+        end
+    end
+
+    if State.jitter > 0 then
+        target = target * (1 + (math.random() * 2 - 1) * State.jitter)
+    end
+    return target
+end
+
+-- Rubber-band detector. A server correction shows up as a displacement jump the
+-- character's own velocity cannot explain.
+local function checkRubberBand(root, dt)
+    local now = os.clock()
+    if now - Engine.rbWindow > RB_WINDOW then
+        Engine.rbWindow = now
+        Engine.rbHits = 0
+    end
+
+    local position = root.Position
+    if Engine.lastPos then
+        local delta = (position - Engine.lastPos).Magnitude
+        local expected = Engine.speed * dt * 2.5 + 2
+        if delta > math.max(expected, RB_MIN_JUMP) then
+            Engine.rbHits += 1
+            if Engine.rbHits >= State.rbSensitivity and not Engine.rbLocked() then
+                State.layer4 = false
+                State.multiplier = math.min(State.multiplier, 2.0)
+                State.rbLocked = true
+                Engine.rbHits = 0
+                log("warn", "rubberband", "server correction detected — aggressive layer off, dropped to Stealth")
+                if Engine.onNotice then Engine.onNotice("Rubber-band detected — dropped to Stealth", "warn") end
+                if GUI and GUI.refresh then GUI.refresh() end
+            end
+        end
+    end
+    Engine.lastPos = position
+end
+
+Engine.rbLocked = function() return State.rbLocked end
+
+-- The single per-frame writer. Exactly one Heartbeat connection feeds this.
+local function onHeartbeat(dt)
+    local hum = Engine.humanoid
+    local root = Engine.root
+    if not hum or not root or not hum.Parent or not root.Parent then return end
+    if hum.Health <= 0 then return end
+
+    local dir = readDirection()
+    Engine.dir = dir
+
+    if dir then
+        if not Engine.rampActive then
+            Engine.rampActive = true
+            Engine.rampStart = os.clock()
+        end
+    else
+        Engine.rampActive = false
+    end
+
+    local speed = computeSpeed()
+    Engine.target = (Engine.vanilla and Engine.vanilla.walkSpeed or DEFAULT_WALKSPEED) * State.multiplier
+    Engine.speed = speed
+
+    local grounded = hum.FloorMaterial ~= Enum.Material.Air
+
+    -- LAYER 1 / 2 — property authority + per-frame reassert
+    if State.enabled and State.layer1 then
+        local targetWalk = speed
+        if math.abs(hum.WalkSpeed - targetWalk) > REASSERT_EPSILON then
+            Engine.drift = hum.WalkSpeed - targetWalk
+            if State.layer2 then
+                local now = os.clock()
+                if now - Engine.reassertWindow > REASSERT_WINDOW then
+                    Engine.reassertWindow = now
+                    Engine.reasserts = 0
+                    Engine.reassertBackoff = false
+                end
+                Engine.reasserts += 1
+                if Engine.reasserts > REASSERT_BUDGET then
+                    if not Engine.reassertBackoff then
+                        Engine.reassertBackoff = true
+                        log("warn", "reassert", "WalkSpeed clamp fight — backing off reassert for this window")
+                    end
+                else
+                    pcall(function() hum.WalkSpeed = targetWalk end)
+                    Engine.framesSinceReassert = 0
+                    Engine.status.layer2 = true
+                end
+            else
+                Engine.status.layer2 = false
+            end
+            Engine.status.layer1 = true
+        else
+            Engine.drift = 0
+            Engine.framesSinceReassert += 1
+        end
+    else
+        Engine.status.layer1 = false
+        Engine.status.layer2 = false
+    end
+
+    -- LAYER 3 — velocity constraint
+    if State.enabled and State.layer3 then
+        if ensureConstraint() then
+            local allowed = grounded or State.airControl
+            if allowed and dir then
+                local velocity = dir * speed
+                pcall(function()
+                    Engine.constraint.VectorVelocity = velocity
+                    Engine.constraint.MaxForce = State.maxForce
+                    Engine.constraint.Enabled = true
+                end)
+                Engine.status.layer3 = true
+            else
+                pcall(function()
+                    Engine.constraint.VectorVelocity = Vector3.zero
+                    Engine.constraint.Enabled = false
+                end)
+                Engine.status.layer3 = false
+            end
+        end
+    else
+        if Engine.constraint then
+            pcall(function()
+                Engine.constraint.VectorVelocity = Vector3.zero
+                Engine.constraint.Enabled = false
+            end)
+        end
+        Engine.status.layer3 = false
+    end
+
+    -- LAYER 4 — CFrame micro-step (bounded burst, enforced cooldown)
+    if State.enabled and State.layer4 and not Engine.status.layer3 then
+        local now = os.clock()
+        if dir and now - Engine.microLast >= State.microStepCool then
+            if Engine.microBurst <= 0 then
+                Engine.microBurst = MICROSTEP_BURST
+                Engine.microLast = now
+                Engine.status.layer4 = false
+            else
+                Engine.microBurst -= 1
+                pcall(function()
+                    root.CFrame = root.CFrame + dir * State.microStepDist
+                end)
+                Engine.status.layer4 = true
+            end
+        end
+    else
+        Engine.status.layer4 = false
+        Engine.microBurst = 0
+    end
+
+    -- Jump reassert
+    if State.enabled and State.jumpEnabled then
+        local snapshot = Engine.vanilla
+        if snapshot then
+            pcall(function()
+                if hum.UseJumpPower then
+                    if math.abs(hum.JumpPower - State.jumpPower) > 0.5 then
+                        hum.JumpPower = State.jumpPower
+                    end
+                else
+                    local targetHeight = State.jumpPower * 0.14
+                    if math.abs(hum.JumpHeight - targetHeight) > 0.5 then
+                        hum.JumpHeight = targetHeight
+                    end
+                end
+            end)
+        end
+    end
+
+    -- Gravity scale
+    if State.enabled and State.gravityEnabled then
+        local snapshot = Engine.vanilla
+        if snapshot then
+            local targetGravity = snapshot.gravity * State.gravityScale
+            if math.abs(Workspace.Gravity - targetGravity) > 0.5 then
+                pcall(function() Workspace.Gravity = targetGravity end)
+            end
+        end
+    end
+
+    checkRubberBand(root, dt)
+end
+
+function Engine.attach(character)
+    Engine.detach()
+    if not character then return false end
+
+    local hum = character:FindFirstChildOfClass("Humanoid")
+    local root = waitFor(character, "HumanoidRootPart", 5)
+    if not hum or not root then
+        log("warn", "attach", "character missing Humanoid or HumanoidRootPart")
+        return false
+    end
+
+    Engine.character = character
+    Engine.humanoid = hum
+    Engine.root = root
+    Engine.captureVanilla()
+    Engine.lastPos = root.Position
+    Engine.rampActive = false
+    Engine.reassertWindow = os.clock()
+    Engine.rbWindow = os.clock()
+    Engine.reassertBackoff = false
+
+    Engine.stopConnection()
+    Engine.connection = RunService.Heartbeat:Connect(function(dt)
+        local ok, err = pcall(onHeartbeat, dt)
+        if not ok then
+            log("error", "heartbeat", tostring(err))
+        end
+    end)
+
+    log("info", "attach", "engine attached — vanilla WalkSpeed " .. tostring(Engine.vanilla.walkSpeed))
+    return true
+end
+
+-- Re-push current State into the engine without a respawn.
+function Engine.apply()
+    if not Engine.humanoid then return end
+    if not State.enabled then
+        Engine.restoreVanilla()
+        Engine.destroyConstraint()
+        return
+    end
+    if State.layer3 then
+        ensureConstraint()
+    else
+        Engine.destroyConstraint()
+    end
+    if not State.gravityEnabled then
+        local snapshot = Engine.vanilla
+        if snapshot then pcall(function() Workspace.Gravity = snapshot.gravity end) end
+    end
+    if not State.jumpEnabled then
+        local snapshot = Engine.vanilla
+        local hum = Engine.humanoid
+        if snapshot and hum then
+            pcall(function()
+                hum.JumpPower = snapshot.jumpPower
+                hum.JumpHeight = snapshot.jumpHeight
+                hum.UseJumpPower = snapshot.useJumpPower
+            end)
+        end
+    end
+end
+
+--=============================================================================
+-- SECTION 6 — CHARACTER LIFECYCLE
+--=============================================================================
+
+local Lifecycle = { connections = {} }
+
+local function bindLifecycle()
+    local function connect(signal, handler)
+        Lifecycle.connections[#Lifecycle.connections + 1] = signal:Connect(handler)
+    end
+
+    connect(LocalPlayer.CharacterAdded, function(character)
+        task.defer(function()
+            local hum = waitFor(character, "Humanoid", 5)
+            if hum then
+                hum.Died:Connect(function()
+                    Engine.destroyConstraint()
+                    Engine.status.layer3 = false
+                end)
+            end
+            Engine.attach(character)
+            Engine.apply()
+        end)
+    end)
+
+    connect(LocalPlayer.CharacterRemoving, function()
+        Engine.destroyConstraint()
+        Engine.stopConnection()
+        Engine.status.layer3 = false
+    end)
+
+    connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), function()
+        -- camera swaps do not touch the engine, but direction fallback needs a
+        -- live camera; nothing to do beyond keeping the reference fresh
+    end)
+end
+
+local function unbindLifecycle()
+    for _, connection in ipairs(Lifecycle.connections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(Lifecycle.connections)
+end
+
+--=============================================================================
+-- SECTION 7 — GUI
+--=============================================================================
+
+local Theme = {
+    bg       = Color3.fromRGB(17, 18, 23),
+    panel    = Color3.fromRGB(25, 27, 34),
+    panelAlt = Color3.fromRGB(32, 35, 44),
+    stroke   = Color3.fromRGB(50, 54, 66),
+    text     = Color3.fromRGB(233, 235, 241),
+    dim      = Color3.fromRGB(148, 154, 170),
+    accent   = Color3.fromRGB(96, 165, 250),
+    good     = Color3.fromRGB(90, 200, 140),
+    warn     = Color3.fromRGB(230, 190, 90),
+    bad      = Color3.fromRGB(235, 96, 96),
+}
+
+local FontRegular = Enum.Font.GothamMedium
+local FontBold    = Enum.Font.GothamBold
+
+local function make(class, props, parent)
+    local instance = Instance.new(class)
+    for key, value in pairs(props) do
+        instance[key] = value
+    end
+    instance.Parent = parent
+    return instance
+end
+
+local function corner(parent, radius)
+    return make("UICorner", { CornerRadius = UDim.new(0, radius or 8) }, parent)
+end
+
+local function stroke(parent, color, thickness)
+    return make("UIStroke", {
+        Color = color or Theme.stroke,
+        Thickness = thickness or 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, parent)
+end
+
+GUI = {
+    connections = {},
+    controls = {},
+    screen = nil,
+    frame = nil,
+    body = nil,
+    pill = nil,
+    capture = nil,
+    scale = nil,
+    notice = nil,
+    tabs = {},
+    activeTab = "Movement",
+}
+
+local function trackConnection(connection)
+    GUI.connections[#GUI.connections + 1] = connection
+    return connection
+end
+
+----- control factories -------------------------------------------------------
+
+local function makeLabel(parent, text, order, height, color, bold)
+    return make("TextLabel", {
+        Size = UDim2.new(1, 0, 0, height or 18),
+        BackgroundTransparency = 1,
+        Font = bold and FontBold or FontRegular,
+        Text = text,
+        TextColor3 = color or Theme.text,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        LayoutOrder = order or 0,
+    }, parent)
+end
+
+local function makeSection(parent, text, order)
+    local holder = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 26),
+        BackgroundTransparency = 1,
+        LayoutOrder = order or 0,
+    }, parent)
+    makeLabel(holder, text, 0, 26, Theme.dim, true)
+    return holder
+end
+
+local function makeToggle(parent, options)
+    local row = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 30),
+        BackgroundTransparency = 1,
+        LayoutOrder = options.order or 0,
+    }, parent)
+
+    makeLabel(row, options.text, 0, 30, Theme.text, false)
+
+    local switch = make("Frame", {
+        Size = UDim2.new(0, 38, 0, 20),
+        Position = UDim2.new(1, -38, 0.5, -10),
+        BackgroundColor3 = options.value and Theme.accent or Theme.panelAlt,
+        BackgroundTransparency = 0,
+        BorderSizePixel = 0,
+    }, row)
+    corner(switch, 10)
+    stroke(switch, Theme.stroke, 1)
+
+    local knob = make("Frame", {
+        Size = UDim2.new(0, 14, 0, 14),
+        Position = UDim2.new(0, 3, 0.5, -7),
+        BackgroundColor3 = Color3.fromRGB(245, 246, 250),
+        BorderSizePixel = 0,
+    }, switch)
+    corner(knob, 7)
+
+    local button = make("TextButton", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Text = "",
+    }, row)
+
+    local handle = { value = options.value, frame = row, set = nil }
+
+    local function paint(value)
+        handle.value = value
+        local goal = value
+            and UDim2.new(0, 21, 0.5, -7)
+            or UDim2.new(0, 3, 0.5, -7)
+        TweenService:Create(knob, TweenInfo.new(0.14, Enum.EasingStyle.Quad), { Position = goal }):Play()
+        TweenService:Create(switch, TweenInfo.new(0.14, Enum.EasingStyle.Quad), {
+            BackgroundColor3 = value and Theme.accent or Theme.panelAlt,
+        }):Play()
+    end
+
+    handle.set = function(value, silent)
+        paint(value)
+        if not silent and options.onChange then options.onChange(value) end
+    end
+
+    trackConnection(button.MouseButton1Click:Connect(function()
+        handle.set(not handle.value)
+    end))
+    trackConnection(button.MouseEnter:Connect(function()
+        TweenService:Create(switch, TweenInfo.new(0.12), {
+            BackgroundColor3 = handle.value and Theme.accent or Color3.fromRGB(44, 48, 60),
+        }):Play()
+    end))
+    trackConnection(button.MouseLeave:Connect(function()
+        TweenService:Create(switch, TweenInfo.new(0.12), {
+            BackgroundColor3 = handle.value and Theme.accent or Theme.panelAlt,
+        }):Play()
+    end))
+
+    return handle
+end
+
+local function makeSlider(parent, options)
+    local row = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 44),
+        BackgroundTransparency = 1,
+        LayoutOrder = options.order or 0,
+    }, parent)
+
+    makeLabel(row, options.text, 0, 18, Theme.text, false)
+
+    local valueLabel = make("TextLabel", {
+        Size = UDim2.new(0.5, 0, 0, 18),
+        Position = UDim2.new(0.5, 0, 0, 0),
+        BackgroundTransparency = 1,
+        Font = FontRegular,
+        Text = "",
+        TextColor3 = Theme.dim,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Right,
+    }, row)
+
+    local hit = make("TextButton", {
+        Size = UDim2.new(1, 0, 0, 20),
+        Position = UDim2.new(0, 0, 0, 22),
+        BackgroundTransparency = 1,
+        Text = "",
+    }, row)
+
+    local track = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 4),
+        Position = UDim2.new(0, 0, 0.5, -2),
+        BackgroundColor3 = Theme.panelAlt,
+        BorderSizePixel = 0,
+    }, hit)
+    corner(track, 2)
+
+    local fill = make("Frame", {
+        Size = UDim2.new(0, 0, 1, 0),
+        BackgroundColor3 = Theme.accent,
+        BorderSizePixel = 0,
+    }, track)
+    corner(fill, 2)
+
+    local thumb = make("Frame", {
+        Size = UDim2.new(0, 12, 0, 12),
+        Position = UDim2.new(0, -6, 0.5, -6),
+        BackgroundColor3 = Color3.fromRGB(245, 246, 250),
+        BorderSizePixel = 0,
+    }, track)
+    corner(thumb, 6)
+    stroke(thumb, Theme.bg, 2)
+
+    local handle = { value = options.value, frame = row, set = nil, get = nil }
+    local format = options.format or function(value) return string.format("%.2f", value) end
+    local step = options.step or 0
+
+    local function quantize(value)
+        value = clamp(value, options.min, options.max)
+        if step > 0 then
+            value = options.min + math.floor((value - options.min) / step + 0.5) * step
+            value = clamp(value, options.min, options.max)
+        end
+        return value
+    end
+
+    local function paint(value)
+        handle.value = value
+        local ratio = 0
+        if options.max > options.min then
+            ratio = (value - options.min) / (options.max - options.min)
+        end
+        fill.Size = UDim2.new(ratio, 0, 1, 0)
+        thumb.Position = UDim2.new(ratio, -6, 0.5, -6)
+        valueLabel.Text = format(value)
+    end
+
+    local function setFromX(absoluteX)
+        local width = track.AbsoluteSize.X
+        if width <= 0 then return end
+        local ratio = clamp((absoluteX - track.AbsolutePosition.X) / width, 0, 1)
+        local value = quantize(options.min + (options.max - options.min) * ratio)
+        if value ~= handle.value then
+            paint(value)
+            if options.onChange then options.onChange(value) end
+        end
+    end
+
+    handle.set = function(value, silent)
+        paint(quantize(value))
+        if not silent and options.onChange then options.onChange(handle.value) end
+    end
+    handle.get = function() return handle.value end
+
+    trackConnection(hit.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            setFromX(input.Position.X)
+            local dragging = true
+            local moveConnection, endConnection
+            moveConnection = trackConnection(UserInputService.InputChanged:Connect(function(changed)
+                if not dragging then return end
+                if changed.UserInputType == Enum.UserInputType.MouseMovement
+                    or changed.UserInputType == Enum.UserInputType.Touch then
+                    setFromX(changed.Position.X)
+                end
+            end))
+            endConnection = trackConnection(UserInputService.InputEnded:Connect(function(ended)
+                if ended.UserInputType == Enum.UserInputType.MouseButton1
+                    or ended.UserInputType == Enum.UserInputType.Touch then
+                    dragging = false
+                    pcall(function() moveConnection:Disconnect() end)
+                    pcall(function() endConnection:Disconnect() end)
+                end
+            end))
+        end
+    end))
+
+    paint(options.value)
+    return handle
+end
+
+local function makeButton(parent, options)
+    local button = make("TextButton", {
+        Size = UDim2.new(options.width or 1, 0, 0, 28),
+        BackgroundColor3 = options.danger and Theme.bad or Theme.panelAlt,
+        BorderSizePixel = 0,
+        Font = FontBold,
+        Text = options.text,
+        TextColor3 = Theme.text,
+        TextSize = 13,
+        AutoButtonColor = false,
+        LayoutOrder = options.order or 0,
+    }, parent)
+    corner(button, 6)
+    stroke(button, Theme.stroke, 1)
+
+    trackConnection(button.MouseEnter:Connect(function()
+        TweenService:Create(button, TweenInfo.new(0.1), {
+            BackgroundColor3 = options.danger and Color3.fromRGB(200, 70, 70) or Color3.fromRGB(42, 46, 58),
+        }):Play()
+    end))
+    trackConnection(button.MouseLeave:Connect(function()
+        TweenService:Create(button, TweenInfo.new(0.1), {
+            BackgroundColor3 = options.danger and Theme.bad or Theme.panelAlt,
+        }):Play()
+    end))
+    trackConnection(button.MouseButton1Click:Connect(function()
+        if options.onClick then options.onClick() end
+    end))
+
+    return { frame = button }
+end
+
+local function makeKeybind(parent, options)
+    local row = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 30),
+        BackgroundTransparency = 1,
+        LayoutOrder = options.order or 0,
+    }, parent)
+
+    makeLabel(row, options.text, 0, 30, Theme.text, false)
+
+    local button = make("TextButton", {
+        Size = UDim2.new(0, 110, 0, 24),
+        Position = UDim2.new(1, -110, 0.5, -12),
+        BackgroundColor3 = Theme.panelAlt,
+        BorderSizePixel = 0,
+        Font = FontRegular,
+        Text = options.value,
+        TextColor3 = Theme.text,
+        TextSize = 12,
+        AutoButtonColor = false,
+    }, row)
+    corner(button, 5)
+    stroke(button, Theme.stroke, 1)
+
+    local handle = { value = options.value, set = nil }
+
+    handle.set = function(value)
+        handle.value = value
+        button.Text = value
+    end
+
+    trackConnection(button.MouseButton1Click:Connect(function()
+        button.Text = "press a key..."
+        GUI.capture = function(keyCode)
+            handle.set(keyCode.Name)
+            if options.onChange then options.onChange(keyCode.Name) end
+        end
+    end))
+
+    return handle
+end
+
+----- window ------------------------------------------------------------------
+
+local function makeTabContent(parent, name)
+    local content = make("ScrollingFrame", {
+        Name = name,
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = Theme.stroke,
+        Visible = name == "Movement",
+        Padding = UDim.new(0, 0),
+    }, parent)
+    make("UIPadding", {
+        PaddingLeft = UDim.new(0, 14),
+        PaddingRight = UDim.new(0, 14),
+        PaddingTop = UDim.new(0, 10),
+        PaddingBottom = UDim.new(0, 12),
+    }, content)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 8),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, content)
+    return content
+end
+
+local function buildWindow(env)
+    local parentGui
+    if env.gethui then
+        local ok, hui = pcall(env.gethui)
+        if ok then parentGui = hui end
+    end
+
+    local screen = make("ScreenGui", {
+        Name = "PBXMovementGui",
+        ResetOnSpawn = false,
+        IgnoreGuiInset = true,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        DisplayOrder = 50,
+    }, nil)
+
+    if parentGui then
+        screen.Parent = parentGui
+    else
+        local ok = pcall(function() screen.Parent = game:GetService("CoreGui") end)
+        if not ok or not screen.Parent then
+            screen.Parent = waitFor(LocalPlayer, "PlayerGui", 10)
+        end
+    end
+
+    local frame = make("Frame", {
+        Name = "Window",
+        Size = UDim2.new(0, 440, 0, 430),
+        Position = UDim2.new(0.5, -220, 0.5, -215),
+        BackgroundColor3 = Theme.bg,
+        BorderSizePixel = 0,
+        Active = true,
+    }, screen)
+    corner(frame, 10)
+    stroke(frame, Theme.stroke, 1)
+
+    local scale = make("UIScale", { Scale = State.uiScale }, frame)
+
+    local header = make("Frame", {
+        Name = "Header",
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = Theme.panel,
+        BorderSizePixel = 0,
+    }, frame)
+    corner(header, 10)
+    make("Frame", {
+        Size = UDim2.new(1, 0, 0, 12),
+        Position = UDim2.new(0, 0, 1, -12),
+        BackgroundColor3 = Theme.panel,
+        BorderSizePixel = 0,
+    }, header)
+
+    local gradient = make("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, Theme.accent),
+            ColorSequenceKeypoint.new(1, Color3.fromRGB(140, 100, 250)),
+        }),
+        Rotation = 12,
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(1, 0.92),
+        }),
+    }, header)
+
+    local title = make("TextLabel", {
+        Size = UDim2.new(1, -110, 0, 40),
+        Position = UDim2.new(0, 14, 0, 0),
+        BackgroundTransparency = 1,
+        Font = FontBold,
+        Text = "PENABLOX  ·  MOVEMENT",
+        TextColor3 = Theme.text,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, header)
+
+    local minimize = make("TextButton", {
+        Size = UDim2.new(0, 24, 0, 24),
+        Position = UDim2.new(1, -60, 0.5, -12),
+        BackgroundColor3 = Theme.panelAlt,
+        BorderSizePixel = 0,
+        Font = FontBold,
+        Text = "–",
+        TextColor3 = Theme.text,
+        TextSize = 14,
+        AutoButtonColor = false,
+    }, header)
+    corner(minimize, 5)
+
+    local close = make("TextButton", {
+        Size = UDim2.new(0, 24, 0, 24),
+        Position = UDim2.new(1, -32, 0.5, -12),
+        BackgroundColor3 = Theme.panelAlt,
+        BorderSizePixel = 0,
+        Font = FontBold,
+        Text = "×",
+        TextColor3 = Theme.text,
+        TextSize = 14,
+        AutoButtonColor = false,
+    }, header)
+    corner(close, 5)
+
+    local body = make("Frame", {
+        Name = "Body",
+        Size = UDim2.new(1, 0, 1, -40),
+        Position = UDim2.new(0, 0, 0, 40),
+        BackgroundTransparency = 1,
+    }, frame)
+
+    local tabBar = make("Frame", {
+        Size = UDim2.new(1, -28, 0, 30),
+        Position = UDim2.new(0, 14, 0, 8),
+        BackgroundTransparency = 1,
+    }, body)
+    make("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, tabBar)
+
+    local contentHolder = make("Frame", {
+        Size = UDim2.new(1, 0, 1, -46),
+        Position = UDim2.new(0, 0, 0, 46),
+        BackgroundTransparency = 1,
+    }, body)
+
+    local tabNames = { "Movement", "Advanced", "Settings", "About" }
+    local tabButtons = {}
+    local tabFrames = {}
+    local tabHandles = {}
+
+    for index, name in ipairs(tabNames) do
+        local button = make("TextButton", {
+            Size = UDim2.new(0, 0, 1, 0),
+            AutomaticSize = Enum.AutomaticSize.X,
+            BackgroundColor3 = Theme.panel,
+            BorderSizePixel = 0,
+            Font = FontRegular,
+            Text = name,
+            TextColor3 = Theme.dim,
+            TextSize = 12,
+            AutoButtonColor = false,
+            LayoutOrder = index,
+        }, tabBar)
+        make("UIPadding", {
+            PaddingLeft = UDim.new(0, 12),
+            PaddingRight = UDim.new(0, 12),
+        }, button)
+        corner(button, 6)
+        tabButtons[name] = button
+        tabFrames[name] = makeTabContent(contentHolder, name)
+    end
+
+    -- pill (minimized state)
+    local pill = make("TextButton", {
+        Name = "Pill",
+        Size = UDim2.new(0, 132, 0, 30),
+        Position = UDim2.new(0.5, -66, 0.5, -15),
+        BackgroundColor3 = Theme.panel,
+        BorderSizePixel = 0,
+        Font = FontBold,
+        Text = "PENABLOX",
+        TextColor3 = Theme.accent,
+        TextSize = 11,
+        AutoButtonColor = false,
+        Visible = false,
+    }, screen)
+    corner(pill, 15)
+    stroke(pill, Theme.stroke, 1)
+
+    GUI.screen = screen
+    GUI.frame = frame
+    GUI.body = body
+    GUI.pill = pill
+    GUI.scale = scale
+    GUI.tabs = tabFrames
+
+    local function selectTab(name)
+        GUI.activeTab = name
+        for tabName, tabButton in pairs(tabButtons) do
+            tabButton.BackgroundColor3 = (tabName == name) and Theme.panelAlt or Theme.panel
+            tabButton.TextColor3 = (tabName == name) and Theme.text or Theme.dim
+        end
+        for tabName, content in pairs(tabFrames) do
+            content.Visible = (tabName == name)
+        end
+    end
+
+    for name, button in pairs(tabButtons) do
+        trackConnection(button.MouseButton1Click:Connect(function() selectTab(name) end))
+    end
+
+    -- drag
+    local dragging = false
+    local dragOffset = Vector2.zero
+    trackConnection(header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragOffset = Vector2.new(input.Position.X - frame.AbsolutePosition.X,
+                                     input.Position.Y - frame.AbsolutePosition.Y)
+        end
+    end))
+    trackConnection(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+    trackConnection(UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        local viewport = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(1920, 1080)
+        local size = frame.AbsoluteSize
+        local x = clamp(input.Position.X - dragOffset.X, 0, math.max(0, viewport.X - size.X))
+        local y = clamp(input.Position.Y - dragOffset.Y, 0, math.max(0, viewport.Y - size.Y))
+        frame.Position = UDim2.fromOffset(x, y)
+    end))
+
+    -- minimize / restore
+    local minimized = State.minimized
+    local function setMinimized(value)
+        minimized = value
+        State.minimized = value
+        frame.Visible = not value
+        pill.Visible = value
+    end
+
+    trackConnection(minimize.MouseButton1Click:Connect(function() setMinimized(true) end))
+    trackConnection(pill.MouseButton1Click:Connect(function() setMinimized(false) end))
+    trackConnection(close.MouseButton1Click:Connect(function() setMinimized(true) end))
+    setMinimized(minimized)
+
+    -- toast
+    local notice = make("TextLabel", {
+        Size = UDim2.new(1, -28, 0, 26),
+        Position = UDim2.new(0, 14, 1, -36),
+        BackgroundColor3 = Theme.panelAlt,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Font = FontRegular,
+        Text = "",
+        TextColor3 = Theme.text,
+        TextSize = 12,
+        Visible = false,
+    }, body)
+    corner(notice, 6)
+
+    local noticeToken = 0
+    local function showNotice(text, kind)
+        noticeToken += 1
+        local token = noticeToken
+        notice.Text = text
+        notice.TextColor3 = kind == "bad" and Theme.bad or (kind == "warn" and Theme.warn or Theme.good)
+        notice.Visible = true
+        notice.BackgroundTransparency = 0.15
+        TweenService:Create(notice, TweenInfo.new(0.15), { BackgroundTransparency = 0.15 }):Play()
+        task.delay(2.4, function()
+            if token ~= noticeToken then return end
+            TweenService:Create(notice, TweenInfo.new(0.3), { BackgroundTransparency = 1 }):Play()
+            task.delay(0.35, function()
+                if token == noticeToken then notice.Visible = false end
+            end)
+        end)
+    end
+    GUI.notice = showNotice
+
+    selectTab(GUI.activeTab)
+
+    -- expose for the control builders
+    GUI.tabFrames = tabFrames
+    GUI.tabButtons = tabButtons
+
+    return {
+        screen = screen,
+        frame = frame,
+        scale = scale,
+        tabs = tabFrames,
+        selectTab = selectTab,
+        showNotice = showNotice,
+        setMinimized = setMinimized,
+        title = title,
+    }
+end
+
+----- panels ------------------------------------------------------------------
+
+local function buildMovementTab(win)
+    local tab = win.tabs.Movement
+    local handles = {}
+
+    handles.master = makeToggle(tab, {
+        text = "Enable movement engine",
+        value = State.enabled,
+        order = 1,
+        onChange = function(value)
+            State.enabled = value
+            Engine.apply()
+        end,
+    })
+
+    handles.speed = makeSlider(tab, {
+        text = "Speed multiplier",
+        min = 1.0, max = 12.0, step = 0.1,
+        value = State.multiplier,
+        order = 2,
+        format = function(value) return string.format("%.1fx", value) end,
+        onChange = function(value)
+            State.multiplier = value
+            if value > 2.0 and State.rbLocked then
+                State.rbLocked = false
+                win.showNotice("Aggressive band re-armed by user", "warn")
+            end
+            if handles.band then
+                local band = bandFor(value)
+                handles.band.Text = band.name
+                handles.band.TextColor3 = band.color
+            end
+            Engine.apply()
+        end,
+    })
+
+    local bandRow = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 18),
+        BackgroundTransparency = 1,
+        LayoutOrder = 3,
+    }, tab)
+    makeLabel(bandRow, "Risk band", 0, 18, Theme.dim, false)
+    handles.band = make("TextLabel", {
+        Size = UDim2.new(0.6, 0, 0, 18),
+        Position = UDim2.new(0.4, 0, 0, 0),
+        BackgroundTransparency = 1,
+        Font = FontBold,
+        Text = bandFor(State.multiplier).name,
+        TextColor3 = bandFor(State.multiplier).color,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Right,
+    }, bandRow)
+
+    handles.ramp = makeSlider(tab, {
+        text = "Acceleration ramp",
+        min = 0.0, max = 1.0, step = 0.01,
+        value = State.rampTime,
+        order = 4,
+        format = function(value) return string.format("%.2fs", value) end,
+        onChange = function(value) State.rampTime = value end,
+    })
+
+    handles.jitter = makeSlider(tab, {
+        text = "Displacement jitter",
+        min = 0.0, max = 0.15, step = 0.005,
+        value = State.jitter,
+        order = 5,
+        format = function(value) return string.format("%.3f", value) end,
+        onChange = function(value) State.jitter = value end,
+    })
+
+    handles.jump = makeSlider(tab, {
+        text = "Jump power",
+        min = 0.0, max = 200.0, step = 1,
+        value = State.jumpPower,
+        order = 6,
+        format = function(value) return string.format("%d", value) end,
+        onChange = function(value)
+            State.jumpPower = value
+            Engine.apply()
+        end,
+    })
+
+    handles.jumpToggle = makeToggle(tab, {
+        text = "Apply jump power",
+        value = State.jumpEnabled,
+        order = 7,
+        onChange = function(value)
+            State.jumpEnabled = value
+            Engine.apply()
+        end,
+    })
+
+    local presetRow = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 28),
+        BackgroundTransparency = 1,
+        LayoutOrder = 8,
+    }, tab)
+    make("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, presetRow)
+
+    local presetNames = { "Default", "Balanced", "Aggressive" }
+    for index, name in ipairs(presetNames) do
+        makeButton(presetRow, {
+            text = name,
+            width = 0.32,
+            order = index,
+            onClick = function()
+                local preset = PRESETS[name]
+                for key, value in pairs(preset) do
+                    State[key] = value
+                end
+                State.rbLocked = false
+                handles.speed.set(State.multiplier, true)
+                handles.ramp.set(State.rampTime, true)
+                handles.jitter.set(State.jitter, true)
+                handles.jump.set(State.jumpPower, true)
+                local band = bandFor(State.multiplier)
+                handles.band.Text = band.name
+                handles.band.TextColor3 = band.color
+                Engine.apply()
+                win.showNotice("Preset applied: " .. name, "good")
+            end,
+        })
+    end
+
+    return handles
+end
+
+local function buildAdvancedTab(win)
+    local tab = win.tabs.Advanced
+    local handles = {}
+
+    makeSection(tab, "LAYERS", 1)
+
+    handles.layer2 = makeToggle(tab, {
+        text = "Layer 2 — per-frame WalkSpeed reassert",
+        value = State.layer2,
+        order = 2,
+        onChange = function(value) State.layer2 = value end,
+    })
+
+    handles.layer3 = makeToggle(tab, {
+        text = "Layer 3 — LinearVelocity constraint",
+        value = State.layer3,
+        order = 3,
+        onChange = function(value)
+            State.layer3 = value
+            Engine.apply()
+        end,
+    })
+
+    handles.layer4 = makeToggle(tab, {
+        text = "Layer 4 — CFrame micro-step (detection risk)",
+        value = State.layer4,
+        order = 4,
+        onChange = function(value)
+            State.layer4 = value
+            Engine.apply()
+        end,
+    })
+
+    handles.airControl = makeToggle(tab, {
+        text = "Air control (constraint while airborne)",
+        value = State.airControl,
+        order = 5,
+        onChange = function(value) State.airControl = value end,
+    })
+
+    makeSection(tab, "GRAVITY", 6)
+
+    handles.gravity = makeSlider(tab, {
+        text = "Gravity scale",
+        min = 0.1, max = 2.0, step = 0.05,
+        value = State.gravityScale,
+        order = 7,
+        format = function(value) return string.format("%.2fx", value) end,
+        onChange = function(value)
+            State.gravityScale = value
+            if State.gravityEnabled then Engine.apply() end
+        end,
+    })
+
+    handles.gravityToggle = makeToggle(tab, {
+        text = "Apply gravity scale",
+        value = State.gravityEnabled,
+        order = 8,
+        onChange = function(value)
+            State.gravityEnabled = value
+            Engine.apply()
+        end,
+    })
+
+    makeButton(tab, {
+        text = "Restore vanilla gravity",
+        order = 9,
+        onClick = function()
+            State.gravityEnabled = false
+            handles.gravityToggle.set(false, true)
+            if Engine.vanilla then
+                pcall(function() Workspace.Gravity = Engine.vanilla.gravity end)
+            end
+            win.showNotice("Gravity restored", "good")
+        end,
+    })
+
+    makeSection(tab, "DETECTION", 10)
+
+    handles.rb = makeSlider(tab, {
+        text = "Rubber-band sensitivity (hits before drop)",
+        min = 1, max = 10, step = 1,
+        value = State.rbSensitivity,
+        order = 11,
+        format = function(value) return string.format("%d", value) end,
+        onChange = function(value) State.rbSensitivity = value end,
+    })
+
+    handles.force = makeSlider(tab, {
+        text = "Constraint max force",
+        min = 10000, max = 400000, step = 5000,
+        value = State.maxForce,
+        order = 12,
+        format = function(value) return string.format("%dk", math.floor(value / 1000)) end,
+        onChange = function(value) State.maxForce = value end,
+    })
+
+    makeSection(tab, "DIAGNOSTICS", 13)
+
+    local diagFrame = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 92),
+        BackgroundColor3 = Theme.panel,
+        BorderSizePixel = 0,
+        LayoutOrder = 14,
+    }, tab)
+    corner(diagFrame, 6)
+    stroke(diagFrame, Theme.stroke, 1)
+    make("UIPadding", {
+        PaddingLeft = UDim.new(0, 10),
+        PaddingRight = UDim.new(0, 10),
+        PaddingTop = UDim.new(0, 8),
+        PaddingBottom = UDim.new(0, 8),
+    }, diagFrame)
+
+    local diagGrid = make("Frame", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+    }, diagFrame)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 2),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, diagGrid)
+
+    local diagLines = {}
+    local diagKeys = { "WalkSpeed", "Drift", "Constraint", "Layers", "Ramp", "Rubber-band" }
+    for index, key in ipairs(diagKeys) do
+        local row = make("Frame", {
+            Size = UDim2.new(1, 0, 0, 13),
+            BackgroundTransparency = 1,
+            LayoutOrder = index,
+        }, diagGrid)
+        makeLabel(row, key, 0, 13, Theme.dim, false).TextSize = 11
+        local valueLabel = make("TextLabel", {
+            Size = UDim2.new(0.6, 0, 0, 13),
+            Position = UDim2.new(0.4, 0, 0, 0),
+            BackgroundTransparency = 1,
+            Font = FontRegular,
+            Text = "—",
+            TextColor3 = Theme.text,
+            TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Right,
+        }, row)
+        diagLines[key] = valueLabel
+    end
+
+    handles.diag = diagLines
+
+    return handles
+end
+
+local function buildSettingsTab(win, env)
+    local tab = win.tabs.Settings
+    local handles = {}
+
+    makeSection(tab, "KEYBINDS", 1)
+
+    handles.toggleKey = makeKeybind(tab, {
+        text = "Toggle GUI",
+        value = State.toggleKey,
+        order = 2,
+        onChange = function(name) State.toggleKey = name end,
+    })
+
+    handles.panicKey = makeKeybind(tab, {
+        text = "Panic revert",
+        value = State.panicKey,
+        order = 3,
+        onChange = function(name) State.panicKey = name end,
+    })
+
+    makeSection(tab, "INTERFACE", 4)
+
+    handles.uiScale = makeSlider(tab, {
+        text = "UI scale",
+        min = 0.7, max = 1.4, step = 0.05,
+        value = State.uiScale,
+        order = 5,
+        format = function(value) return string.format("%.2fx", value) end,
+        onChange = function(value)
+            State.uiScale = value
+            if GUI.scale then GUI.scale.Scale = value end
+        end,
+    })
+
+    makeSection(tab, "CONFIG", 6)
+
+    local saveButton = makeButton(tab, {
+        text = "Save config",
+        order = 7,
+        onClick = function()
+            local ok = Persistence.save()
+            win.showNotice(ok and "Config saved" or "Save failed", ok and "good" or "bad")
+        end,
+    })
+
+    local loadButton = makeButton(tab, {
+        text = "Load config",
+        order = 8,
+        onClick = function()
+            local ok = Persistence.load()
+            win.showNotice(ok and "Config loaded" or "No config found", ok and "good" or "warn")
+            if ok and GUI.refresh then GUI.refresh() end
+        end,
+    })
+
+    local resetButton = makeButton(tab, {
+        text = "Reset to defaults",
+        order = 9,
+        danger = true,
+        onClick = function()
+            Persistence.reset()
+            win.showNotice("Defaults restored", "warn")
+            if GUI.refresh then GUI.refresh() end
+        end,
+    })
+
+    if not env.canPersist then
+        saveButton.frame.TextTransparency = 0.5
+        loadButton.frame.TextTransparency = 0.5
+        saveButton.frame.Active = false
+        loadButton.frame.Active = false
+        saveButton.frame.Selectable = false
+        loadButton.frame.Selectable = false
+        local note = makeLabel(tab, "Executor exposes no filesystem — config is memory-only this session.", 10, 32, Theme.warn, false)
+        note.TextSize = 11
+        note.TextWrapped = true
+    end
+
+    return handles
+end
+
+local function buildAboutTab(win)
+    local tab = win.tabs.About
+    makeLabel(tab, "Penablox movement controller", 1, 20, Theme.text, true)
+    makeLabel(tab, "Layered locomotion: property authority, per-frame reassert, velocity constraint, bounded micro-step.", 2, 44, Theme.dim, false).TextWrapped = true
+    makeLabel(tab, "Version 1.0.0", 3, 18, Theme.dim, false)
+    makeLabel(tab, "Layer 4 (CFrame micro-step) is off by default and carries detection risk. Everything else is reversible from the panic key.", 4, 52, Theme.warn, false).TextWrapped = true
+end
+
+----- diagnostics loop --------------------------------------------------------
+
+local function startDiagnostics(handles)
+    task.spawn(function()
+        while GUI.screen and GUI.screen.Parent do
+            task.wait(DIAG_INTERVAL)
+            local lines = handles and handles.diag
+            if lines then
+                local hum = Engine.humanoid
+                lines.WalkSpeed.Text = hum and string.format("%.2f", hum.WalkSpeed) or "—"
+                lines.Drift.Text = string.format("%.2f", Engine.drift)
+                lines.Constraint.Text = Engine.constraint and (Engine.constraint.Enabled and "active" or "idle") or "none"
+                local active = 0
+                for _, flag in pairs(Engine.status) do
+                    if flag == true then active += 1 end
+                end
+                lines.Layers.Text = string.format("%d/4", active)
+                lines.Ramp.Text = string.format("%.2fs", State.rampTime)
+                lines["Rubber-band"].Text = State.rbLocked and "locked" or string.format("%d/%d", Engine.rbHits, State.rbSensitivity)
+            end
+        end
+    end)
+end
+
+----- build -------------------------------------------------------------------
+
+function GUI.build(env)
+    local win = buildWindow(env)
+    local movementHandles = buildMovementTab(win)
+    local advancedHandles = buildAdvancedTab(win)
+    local settingsHandles = buildSettingsTab(win, env)
+    buildAboutTab(win)
+
+    GUI.handles = {
+        movement = movementHandles,
+        advanced = advancedHandles,
+        settings = settingsHandles,
+    }
+
+    -- keybinds + panic
+    trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+        if GUI.capture then
+            local capture = GUI.capture
+            GUI.capture = nil
+            pcall(capture, input.KeyCode)
+            return
+        end
+
+        local panic = Enum.KeyCode[State.panicKey]
+        if panic and input.KeyCode == panic then
+            Engine.panic()
+            if movementHandles.master then movementHandles.master.set(false, true) end
+            win.showNotice("PANIC — vanilla restored", "bad")
+            return
+        end
+
+        if gameProcessed then return end
+        local toggle = Enum.KeyCode[State.toggleKey]
+        if toggle and input.KeyCode == toggle then
+            win.setMinimized(not State.minimized)
+        end
+    end))
+
+    startDiagnostics(advancedHandles)
+    Engine.onNotice = win.showNotice
+
+    GUI.refresh = function()
+        local m = GUI.handles.movement
+        local a = GUI.handles.advanced
+        local s = GUI.handles.settings
+        m.master.set(State.enabled, true)
+        m.speed.set(State.multiplier, true)
+        m.ramp.set(State.rampTime, true)
+        m.jitter.set(State.jitter, true)
+        m.jump.set(State.jumpPower, true)
+        m.jumpToggle.set(State.jumpEnabled, true)
+        local band = bandFor(State.multiplier)
+        m.band.Text = band.name
+        m.band.TextColor3 = band.color
+        a.layer2.set(State.layer2, true)
+        a.layer3.set(State.layer3, true)
+        a.layer4.set(State.layer4, true)
+        a.airControl.set(State.airControl, true)
+        a.gravity.set(State.gravityScale, true)
+        a.gravityToggle.set(State.gravityEnabled, true)
+        a.rb.set(State.rbSensitivity, true)
+        a.force.set(State.maxForce, true)
+        s.toggleKey.set(State.toggleKey)
+        s.panicKey.set(State.panicKey)
+        s.uiScale.set(State.uiScale, true)
+        if GUI.scale then GUI.scale.Scale = State.uiScale end
+        Engine.apply()
+    end
+
+    return win
+end
+
+function GUI.destroy()
+    for _, connection in ipairs(GUI.connections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(GUI.connections)
+    if GUI.screen then
+        pcall(function() GUI.screen:Destroy() end)
+        GUI.screen = nil
+    end
+end
+
+--=============================================================================
+-- SECTION 8 — PERSISTENCE
+--=============================================================================
+
+Persistence = {}
+
+local function encodeString(value)
+    local out = { '"' }
+    for index = 1, #value do
+        local byte = string.byte(value, index)
+        local char = string.sub(value, index, index)
+        if char == '"' then
+            out[#out + 1] = '\\"'
+        elseif char == "\\" then
+            out[#out + 1] = "\\\\"
+        elseif char == "\n" then
+            out[#out + 1] = "\\n"
+        elseif char == "\r" then
+            out[#out + 1] = "\\r"
+        elseif char == "\t" then
+            out[#out + 1] = "\\t"
+        elseif byte < 32 then
+            out[#out + 1] = string.format("\\u%04x", byte)
+        else
+            out[#out + 1] = char
+        end
+    end
+    out[#out + 1] = '"'
+    return table.concat(out)
+end
+
+local function encodeValue(value)
+    local kind = type(value)
+    if kind == "nil" then
+        return "null"
+    elseif kind == "boolean" then
+        return value and "true" or "false"
+    elseif kind == "number" then
+        if value ~= value or value == math.huge or value == -math.huge then
+            return "0"
+        end
+        return string.format("%.14g", value)
+    elseif kind == "string" then
+        return encodeString(value)
+    elseif kind == "table" then
+        local isArray = #value > 0
+        if isArray then
+            local parts = {}
+            for index = 1, #value do
+                parts[index] = encodeValue(value[index])
+            end
+            return "[" .. table.concat(parts, ",") .. "]"
+        end
+        local parts = {}
+        for key, item in pairs(value) do
+            if type(key) == "string" or type(key) == "number" then
+                parts[#parts + 1] = encodeString(tostring(key)) .. ":" .. encodeValue(item)
+            end
+        end
+        return "{" .. table.concat(parts, ",") .. "}"
+    end
+    return "null"
+end
+
+local function decodeValue(text, position)
+    local length = #text
+
+    local function skip()
+        while position <= length do
+            local char = string.sub(text, position, position)
+            if char == " " or char == "\n" or char == "\r" or char == "\t" then
+                position += 1
+            else
+                break
+            end
+        end
+    end
+
+    local function parseValue()
+        skip()
+        if position > length then return nil end
+        local char = string.sub(text, position, position)
+
+        if char == "{" then
+            position += 1
+            local object = {}
+            skip()
+            if string.sub(text, position, position) == "}" then
+                position += 1
+                return object
+            end
+            while position <= length do
+                skip()
+                if string.sub(text, position, position) ~= '"' then return object end
+                local key = parseValue()
+                skip()
+                if string.sub(text, position, position) == ":" then position += 1 end
+                local value = parseValue()
+                if key ~= nil then object[key] = value end
+                skip()
+                local nextChar = string.sub(text, position, position)
+                if nextChar == "," then
+                    position += 1
+                elseif nextChar == "}" then
+                    position += 1
+                    return object
+                else
+                    return object
+                end
+            end
+            return object
+        elseif char == "[" then
+            position += 1
+            local array = {}
+            skip()
+            if string.sub(text, position, position) == "]" then
+                position += 1
+                return array
+            end
+            while position <= length do
+                array[#array + 1] = parseValue()
+                skip()
+                local nextChar = string.sub(text, position, position)
+                if nextChar == "," then
+                    position += 1
+                elseif nextChar == "]" then
+                    position += 1
+                    return array
+                else
+                    return array
+                end
+            end
+            return array
+        elseif char == '"' then
+            position += 1
+            local buffer = {}
+            while position <= length do
+                local current = string.sub(text, position, position)
+                if current == "\\" then
+                    local escaped = string.sub(text, position + 1, position + 1)
+                    if escaped == "n" then
+                        buffer[#buffer + 1] = "\n"
+                    elseif escaped == "r" then
+                        buffer[#buffer + 1] = "\r"
+                    elseif escaped == "t" then
+                        buffer[#buffer + 1] = "\t"
+                    elseif escaped == "u" then
+                        local hex = string.sub(text, position + 2, position + 5)
+                        local code = tonumber(hex, 16) or 63
+                        buffer[#buffer + 1] = string.char(math.min(code, 255))
+                        position += 4
+                    else
+                        buffer[#buffer + 1] = escaped
+                    end
+                    position += 2
+                elseif current == '"' then
+                    position += 1
+                    return table.concat(buffer)
+                else
+                    buffer[#buffer + 1] = current
+                    position += 1
+                end
+            end
+            return table.concat(buffer)
+        elseif string.sub(text, position, position + 3) == "true" then
+            position += 4
+            return true
+        elseif string.sub(text, position, position + 4) == "false" then
+            position += 5
+            return false
+        elseif string.sub(text, position, position + 3) == "null" then
+            position += 4
+            return nil
+        else
+            local start = position
+            while position <= length do
+                local current = string.sub(text, position, position)
+                if current == "," or current == "}" or current == "]" or current == " "
+                    or current == "\n" or current == "\r" or current == "\t" then
+                    break
+                end
+                position += 1
+            end
+            local number = tonumber(string.sub(text, start, position - 1))
+            return number or 0
+        end
+    end
+
+    return parseValue()
+end
+
+function Persistence.encode(value)
+    return encodeValue(value)
+end
+
+function Persistence.decode(text)
+    local ok, result = pcall(decodeValue, text, 1)
+    if ok and type(result) == "table" then return result end
+    return nil
+end
+
+local function configSnapshot()
+    local snapshot = { version = CONFIG_VERSION }
+    for key, value in pairs(DEFAULTS) do
+        snapshot[key] = State[key]
+    end
+    return snapshot
+end
+
+function Persistence.save()
+    if not ENV.canPersist then return false end
+    local ok = pcall(function()
+        if ENV.isfolder and not ENV.isfolder(CONFIG_FOLDER) then
+            ENV.makefolder(CONFIG_FOLDER)
+        end
+    end)
+    if not ok then
+        log("warn", "persist", "folder creation failed — memory only")
+        return false
+    end
+
+    local payload = Persistence.encode(configSnapshot())
+    local wrote = pcall(function() ENV.writefile(CONFIG_PATH, payload) end)
+    if not wrote then
+        log("warn", "persist", "writefile failed — memory only")
+        return false
+    end
+
+    -- self-check: read back and round-trip before accepting the write
+    local verified = pcall(function()
+        local raw = ENV.readfile(CONFIG_PATH)
+        local parsed = Persistence.decode(raw)
+        if not parsed then error("decode failed") end
+        if parsed.version ~= CONFIG_VERSION then error("version mismatch") end
+        return true
+    end)
+    if not verified then
+        log("warn", "persist", "round-trip self-check failed — discarding write")
+        pcall(function() ENV.delfile(CONFIG_PATH) end)
+        return false
+    end
+
+    State.savedAt = os.time()
+    State.loadedFromDisk = true
+    log("info", "persist", "config saved and verified")
+    return true
+end
+
+function Persistence.load()
+    if not ENV.canPersist then return false end
+    if ENV.isfile and not ENV.isfile(CONFIG_PATH) then return false end
+
+    local ok, raw = pcall(function() return ENV.readfile(CONFIG_PATH) end)
+    if not ok or type(raw) ~= "string" then return false end
+
+    local parsed = Persistence.decode(raw)
+    if not parsed then
+        log("warn", "persist", "config decode failed")
+        return false
+    end
+
+    for key, defaultValue in pairs(DEFAULTS) do
+        local value = parsed[key]
+        if value ~= nil and type(value) == type(defaultValue) then
+            State[key] = value
+        end
+    end
+    State.rbLocked = false
+    State.loadedFromDisk = true
+    log("info", "persist", "config loaded")
+    return true
+end
+
+function Persistence.reset()
+    for key, value in pairs(DEFAULTS) do
+        State[key] = value
+    end
+    State.rbLocked = false
+    Engine.apply()
+end
+
+--=============================================================================
+-- SECTION 9 — BOOTSTRAP
+--=============================================================================
+
+ENV = buildEnv()
+
+-- Re-execution guard: a previous instance is torn down before this one boots,
+-- so two rapid pastes never leave two Heartbeat connections behind.
+local registry = ENV.getgenv
+local previous = nil
+if registry then
+    local ok, existing = pcall(function() return registry.__PBX_MOVEMENT end)
+    if ok then previous = existing end
+end
+
+if previous and type(previous) == "table" and previous.destroy then
+    pcall(previous.destroy)
+end
+
+local function boot()
+    log("info", "boot", string.format(
+        "executor=%s filesystem=%s gethui=%s",
+        tostring(ENV.identify and select(2, pcall(ENV.identify)) or "unknown"),
+        tostring(ENV.canPersist),
+        tostring(ENV.gethui ~= nil)
+    ))
+
+    Persistence.load()
+
+    local win = GUI.build(ENV)
+
+    if not ENV.canPersist then
+        log("info", "boot", "no filesystem — config is memory-only this session")
+    end
+
+    bindLifecycle()
+
+    local character = LocalPlayer.Character
+    if character then
+        task.defer(function()
+            if Engine.attach(character) then
+                Engine.apply()
+            end
+        end)
+    else
+        log("info", "boot", "no character yet — waiting for CharacterAdded")
+    end
+
+    local api
+    api = {
+        version = CONFIG_VERSION,
+        state = State,
+        engine = Engine,
+        gui = GUI,
+        persistence = Persistence,
+        destroy = function()
+            Engine.detach()
+            unbindLifecycle()
+            GUI.destroy()
+            if registry then
+                pcall(function()
+                    if registry.__PBX_MOVEMENT == api then registry.__PBX_MOVEMENT = nil end
+                end)
+            end
+            log("info", "shutdown", "clean teardown complete")
+        end,
+    }
+
+    if registry then
+        registry.__PBX_MOVEMENT = api
+    end
+
+    log("info", "boot", "Penablox movement controller ready")
+    return api
+end
+
+local ok, result = pcall(boot)
+if not ok then
+    log("error", "boot", "bootstrap failed: " .. tostring(result))
+    pcall(function()
+        local screen = Instance.new("ScreenGui")
+        screen.Name = "PBXMovementError"
+        screen.ResetOnSpawn = false
+        screen.Parent = LocalPlayer:FindFirstChild("PlayerGui")
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(0, 420, 0, 60)
+        label.Position = UDim2.new(0, 20, 0, 20)
+        label.BackgroundColor3 = Color3.fromRGB(30, 20, 20)
+        label.TextColor3 = Color3.fromRGB(255, 140, 140)
+        label.Font = Enum.Font.GothamMedium
+        label.TextSize = 12
+        label.TextWrapped = true
+        label.Text = "Penablox movement failed to boot: " .. tostring(result)
+        label.Parent = screen
+    end)
+end
